@@ -23,7 +23,7 @@ sequelize.sync().then(async () => {
   const count = await Category.count();
   if (count === 0) {
     const types = ["Men's Doubles", "Women's Doubles", "Mixed Doubles"];
-    const ageGroups = ["8–12 yrs", "13–17 yrs", "18–34 yrs", "35+"];
+    const ageGroups = ["8-12 yrs", "13-17 yrs", "18-34 yrs", "35+"];
     const categories = [];
     for (const type of types) {
       for (const age of ageGroups) {
@@ -178,90 +178,156 @@ app.get('/api/matches/:categoryId', authenticateToken, async (req, res) => {
 
 app.post('/api/matches/generate/:categoryId', authenticateToken, async (req, res) => {
   const t = await sequelize.transaction();
+
   try {
     const { categoryId } = req.params;
+
     const category = await Category.findByPk(categoryId);
     if (!category) throw new Error("Category not found");
 
+    // Clear old matches
     await Match.destroy({ where: { categoryId }, transaction: t });
 
     const players = await Player.findAll({ where: { categoryId }, transaction: t });
-    if (players.length < 2) throw new Error("Need at least 2 players to generate a bracket");
+    if (players.length < 2) throw new Error("Need at least 2 players");
 
-    const n = players.length;
-    const p = Math.pow(2, Math.ceil(Math.log2(n)));
-    const roundsCount = Math.log2(p);
-
-    let seedSlot = players.map(pl => pl.id).sort(() => Math.random() - 0.5);
-    while (seedSlot.length < p) seedSlot.push(null);
+    // Shuffle players
+    const shuffled = [...players].sort(() => Math.random() - 0.5);
 
     const matchData = [];
-    for (let i = 0; i < p / 2; i++) {
-      const p1 = seedSlot[i * 2];
-      const p2 = seedSlot[i * 2 + 1];
-      const isBye = !p1 || !p2;
-      matchData.push({
-        categoryId, round: 1, position: i,
-        player1Id: p1, player2Id: p2,
-        winnerId: isBye ? (p1 || p2) : null,
-        status: isBye ? 'BYE' : 'PENDING'
-      });
-    }
+    let position = 0;
 
-    let prevCount = p / 2;
-    for (let r = 2; r <= roundsCount; r++) {
-      const currCount = prevCount / 2;
-      for (let i = 0; i < currCount; i++) {
-        matchData.push({ categoryId, round: r, position: i, status: 'PENDING' });
+    for (let i = 0; i < shuffled.length; i += 2) {
+      const p1 = shuffled[i];
+      const p2 = shuffled[i + 1] || null;
+
+      // If odd player → BYE
+      if (!p2) {
+        matchData.push({
+          categoryId,
+          round: 1,
+          position,
+          player1Id: p1.id,
+          player2Id: null,
+          winnerId: p1.id,
+          status: 'BYE'
+        });
+      } else {
+        matchData.push({
+          categoryId,
+          round: 1,
+          position,
+          player1Id: p1.id,
+          player2Id: p2.id,
+          status: 'PENDING'
+        });
       }
-      prevCount = currCount;
+
+      position++;
     }
 
-    const createdMatches = await Match.bulkCreate(matchData, { transaction: t });
-
-    const round1Byes = createdMatches.filter(m => m.round === 1 && m.status === 'BYE');
-    for (const bye of round1Byes) {
-      const nextPos = Math.floor(bye.position / 2);
-      const isP1 = bye.position % 2 === 0;
-      await Match.update(
-        { [isP1 ? 'player1Id' : 'player2Id']: bye.winnerId },
-        { where: { categoryId, round: 2, position: nextPos }, transaction: t }
-      );
-    }
-
+    await Match.bulkCreate(matchData, { transaction: t });
     await t.commit();
-    const final = await Match.findAll({ where: { categoryId } });
+
+    const final = await Match.findAll({
+      where: { categoryId },
+      order: [['round', 'ASC'], ['position', 'ASC']]
+    });
+
     res.json(final);
+
   } catch (err) {
     if (t) await t.rollback();
     res.status(500).json({ error: err.message });
   }
 });
 
+
+
 app.patch('/api/matches/:matchId', authenticateToken, async (req, res) => {
   const t = await sequelize.transaction();
+
   try {
     const { winnerId, score } = req.body;
-    if (!winnerId || !score) return res.status(400).json({ error: "Winner and score are required" });
+    if (!winnerId) return res.status(400).json({ error: "Winner required" });
 
     const match = await Match.findByPk(req.params.matchId, { transaction: t });
     if (!match) throw new Error("Match not found");
-    
-    await match.update({ winnerId, score, status: 'COMPLETED' }, { transaction: t });
 
-    const nextPos = Math.floor(match.position / 2);
-    const isP1 = match.position % 2 === 0;
-    const nextMatch = await Match.findOne({
-      where: { categoryId: match.categoryId, round: match.round + 1, position: nextPos },
+    // Mark match completed
+    await match.update({
+      winnerId,
+      score,
+      status: 'COMPLETED'
+    }, { transaction: t });
+
+    const { categoryId, round } = match;
+
+    // Get all matches of this round
+    const roundMatches = await Match.findAll({
+      where: { categoryId, round },
       transaction: t
     });
 
-    if (nextMatch) {
-      await nextMatch.update({ [isP1 ? 'player1Id' : 'player2Id']: winnerId }, { transaction: t });
+    // Check if this round is fully completed (including BYEs)
+    const allDone = roundMatches.every(m => m.winnerId);
+
+    if (!allDone) {
+      await t.commit();
+      return res.json({ message: "Winner saved, waiting for other matches" });
     }
 
+    // Collect winners
+    const winners = roundMatches.map(m => m.winnerId);
+
+    // If only one winner, tournament over
+    if (winners.length === 1) {
+      await t.commit();
+      return res.json({ message: "Tournament complete", champion: winners[0] });
+    }
+
+    // Shuffle winners
+    const shuffled = [...winners].sort(() => Math.random() - 0.5);
+
+    // Create next round
+    const nextRound = round + 1;
+    const newMatches = [];
+    let position = 0;
+
+    for (let i = 0; i < shuffled.length; i += 2) {
+      const p1 = shuffled[i];
+      const p2 = shuffled[i + 1] || null;
+
+      if (!p2) {
+        // BYE again
+        newMatches.push({
+          categoryId,
+          round: nextRound,
+          position,
+          player1Id: p1,
+          player2Id: null,
+          winnerId: p1,
+          status: 'BYE'
+        });
+      } else {
+        newMatches.push({
+          categoryId,
+          round: nextRound,
+          position,
+          player1Id: p1,
+          player2Id: p2,
+          status: 'PENDING'
+        });
+      }
+
+      position++;
+    }
+
+    await Match.bulkCreate(newMatches, { transaction: t });
+
     await t.commit();
-    res.json(match);
+    res.json({ message: "Next round generated" });
+
   } catch (err) {
     if (t) await t.rollback();
     res.status(500).json({ error: err.message });
