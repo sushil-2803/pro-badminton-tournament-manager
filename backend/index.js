@@ -78,10 +78,40 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.get('/api/categories', authenticateToken, async (req, res) => {
   try {
-    const categories = await Category.findAll();
-    res.json(categories);
+    const categories = await Category.findAll({ order: [['name', 'ASC']] });
+    
+    // Aggregated query for all player counts
+    const playerCounts = await Player.findAll({
+      attributes: ['categoryId', [sequelize.fn('COUNT', sequelize.col('id')), 'count']],
+      group: ['categoryId']
+    });
+
+    // Aggregated query for match statuses
+    const matches = await Match.findAll({
+      attributes: ['categoryId', 'status']
+    });
+
+    const statsMap = {};
+    playerCounts.forEach(p => {
+      statsMap[p.categoryId] = { count: parseInt(p.get('count')), hasMatches: false, allCompleted: true };
+    });
+
+    matches.forEach(m => {
+      if (!statsMap[m.categoryId]) statsMap[m.categoryId] = { count: 0, hasMatches: false, allCompleted: true };
+      statsMap[m.categoryId].hasMatches = true;
+      if (m.status === 'PENDING') statsMap[m.categoryId].allCompleted = false;
+    });
+
+    const results = categories.map(cat => ({
+      ...cat.toJSON(),
+      playerCount: statsMap[cat.id]?.count || 0,
+      completed: statsMap[cat.id]?.hasMatches ? statsMap[cat.id].allCompleted : false
+    }));
+
+    res.json(results);
   } catch (err) {
-    res.status(500).json({ error: "Failed to fetch categories" });
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch categories with stats" });
   }
 });
 
